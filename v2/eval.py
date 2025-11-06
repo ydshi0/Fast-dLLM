@@ -15,6 +15,38 @@
 # SPDX-License-Identifier: Apache-2.0
 # Modified from LLaDA repos: https://github.com/ML-GSAI/LLaDA
 
+# ---- add begin: force GSM8K to load from local parquet when offline ----
+import os as _os
+import datasets as _hfds
+
+_ORIG_LOAD_DATASET = _hfds.load_dataset
+
+def _patched_load_dataset(path, name=None, *args, **kwargs):
+    """Intercept HF load_dataset for gsm8k and redirect to local parquet."""
+    # env: GSM8K_LOCAL_ROOT=/workspace/ydshi/dataset/gsm8k
+    local_root = "/workspace/ydshi/dataset/gsm8k"
+    want_local = bool(local_root) and path in ("openai/gsm8k", "gsm8k")
+
+    if want_local:
+        # split name: "main" 或 "socratic"；harness 默认用 "socratic"
+        split_name = name or "socratic"
+        data_files = {
+            "train": f"{local_root}/{split_name}/train-*.parquet",
+            "test":  f"{local_root}/{split_name}/test-*.parquet",
+        }
+        # 直接用 parquet builder，完全离线
+        return _ORIG_LOAD_DATASET("parquet", data_files=data_files)
+
+    # 其它数据集/路径按原逻辑
+    return _ORIG_LOAD_DATASET(path, name, *args, **kwargs)
+
+_hfds.load_dataset = _patched_load_dataset
+
+# 强烈建议：显式关闭联网，以免别的任务误连网
+_os.environ.setdefault("HF_HUB_OFFLINE", "1")
+_os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+# ---- add end ----
+
 '''
 This file is inspired by the code from https://github.com/ML-GSAI/SMDM
 '''
@@ -53,7 +85,7 @@ class Fast_dLLM_v2EvalHarness(LM):
         model_path='Efficient-Large-Model/Fast_dLLM_v2_7B',
         device="cuda",
         show_speed=False,
-        max_new_tokens=2048,
+        max_new_tokens=32,
         batch_size=32,
         mask_id=151665,
         use_block_cache=False,
@@ -207,7 +239,7 @@ class Fast_dLLM_v2EvalHarness(LM):
     def generate_until(self, requests):
         output = [None] * len(requests)  # pre-allocate output list
         num_tokens = 0
-        
+        prompt_tokens = 0
         start_time = time.time()
         
         requests_with_indices = [(i, req) for i, req in enumerate(requests)]
@@ -224,29 +256,45 @@ class Fast_dLLM_v2EvalHarness(LM):
         if current_batch:
             batched_requests.append(current_batch)
 
+        ban = set(self.tokenizer.all_special_ids + [self.mask_id])
+        allowed_ids = torch.tensor(
+            [i for i in range(self.tokenizer.vocab_size) if i not in ban],
+            device=self.device, dtype=torch.long
+        )
         for _, batch in enumerate(tqdm(batched_requests, desc="Generating...")):
             batched_input_ids = []
             max_len = 0
             min_len = 1e9
             seq_len = []
             
+            L = 2048  
+            max_len = L
+            min_len = L
             for orig_idx, req in batch:
-                question = req.args[0]
-                
-                if req.task_name.startswith('minerva_math'):
-                    question = question.replace("Solution:", "Please reason step by step, and put your final answer within \\boxed{{}}.")
-                elif req.task_name.startswith('gsm8k'):
-                    question = question.replace("Answer:", "Please reason step by step, and put your final answer within \\boxed{{}}.")
-                model_inputs = self.tokenizer([question], return_tensors="pt").to(self.device)
-                batched_input_ids.append(model_inputs["input_ids"])
-                max_len = max(max_len, model_inputs["input_ids"].shape[1])
-                min_len = min(min_len, model_inputs["input_ids"].shape[1])
-                seq_len.append(model_inputs["input_ids"].shape[1])
+
+                seq_len.append(L)
+                idx = torch.randint(0, allowed_ids.numel(), (1, L), device=self.device)
+                ids = allowed_ids[idx] 
+                batched_input_ids.append(ids)
+
+                # question = req.args[0]
+
+                # if req.task_name.startswith('minerva_math'):
+                #     question = question.replace("Solution:", "Please reason step by step, and put your final answer within \\boxed{{}}.")
+                # elif req.task_name.startswith('gsm8k'):
+                #     question = question.replace("Answer:", "Please reason step by step, and put your final answer within \\boxed{{}}.")
+                # model_inputs = self.tokenizer([question], return_tensors="pt").to(self.device)
+                # batched_input_ids.append(model_inputs["input_ids"])
+                # max_len = max(max_len, model_inputs["input_ids"].shape[1])
+                # min_len = min(min_len, model_inputs["input_ids"].shape[1])
+                # seq_len.append(model_inputs["input_ids"].shape[1])
             
             # pad batched_input_ids to the same length
-            batched_input_ids = [torch.cat([input_ids, torch.full((1, max_len - input_ids.shape[1]), self.mask_id, dtype=torch.long, device=self.device)], dim=1) for input_ids in batched_input_ids]
-            batched_input_ids = torch.cat(batched_input_ids, dim=0)
-            batched_input_ids = batched_input_ids.to(self.device)
+            # batched_input_ids = [torch.cat([input_ids, torch.full((1, max_len - input_ids.shape[1]), self.mask_id, dtype=torch.long, device=self.device)], dim=1) for input_ids in batched_input_ids]
+            # batched_input_ids = torch.cat(batched_input_ids, dim=0)
+            # batched_input_ids = batched_input_ids.to(self.device)
+            batched_input_ids = torch.cat(batched_input_ids, dim=0).to(self.device) 
+            print(f"batched_input_ids size {batched_input_ids.size()}")
             
             with torch.no_grad():
                 if self.accelerator is not None:
@@ -274,6 +322,7 @@ class Fast_dLLM_v2EvalHarness(LM):
                         seq_len=torch.tensor(seq_len, device=self.device),
                         use_block_cache=self.use_block_cache,
                         threshold=self.threshold,
+                        mode="both"
                     )
             
             # extract new generated tokens, and keep original index order
@@ -285,18 +334,20 @@ class Fast_dLLM_v2EvalHarness(LM):
             
                 # count token number
                 if self.show_speed:
+                    prompt_tokens += seq_len[batch_pos]
                     num_tokens += (generated_ids[batch_pos][seq_len[batch_pos]:] != self.mask_id).sum()
                 
                 # put result in the correct original index position
                 output[orig_idx] = generated_answer
 
-                print('=' * 20)
-                print('question: ', req.args[0])
-                print('answer: ', generated_answer)
-                print('=' * 20, end='\n\n')
+                # print('=' * 20)
+                # print('question: ', req.args[0])
+                # print('answer: ', generated_answer)
+                # print('=' * 20, end='\n\n')
             
         end_time = time.time()
         if self.show_speed:
+            print(f"Prompt tokens: {prompt_tokens}")
             print(f"Total number of tokens generated: {num_tokens}")
             print(f"Total time taken: {end_time - start_time} seconds")
             print(f"Tokens per second: {num_tokens / (end_time - start_time)}")

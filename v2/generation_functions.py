@@ -2,6 +2,7 @@ from typing import Callable, Optional, Union
 import torch
 import types
 from transformers.utils import auto_docstring, logging
+import time
 
 # Constants for Fast_dLLM model
 FAST_DLLM_MASK_ID = 151665
@@ -29,10 +30,33 @@ class Fast_dLLM_QwenForCausalLM:
         use_block_cache=False,
         top_p=0.95,
         temperature=0.0,
+
+        mode: str = "both",   
     ):
         num_blocks = max_new_tokens // block_size + seq_len.max().item() // block_size
         batch_size = input_ids.shape[0]
 
+        
+        if mode == "prefill":
+            print("sample mode: prefill")
+            prefill_len = (min_len // block_size) * block_size
+            prefill_slice = input_ids[:, :prefill_len]
+            out = self.forward(
+                input_ids=prefill_slice,
+                use_cache=True,
+                update_past_key_values=True,
+                block_size=block_size
+            )
+
+            print(f"past_key_values size {out.past_key_values.key_cache[0].size()}")
+            print("prefill done")
+            exit()
+        
+        
+        prefill_ms = 0
+        decode_ms = 0
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
         if min_len > block_size:
             output = self.forward(input_ids=input_ids[:, :(min_len // block_size * block_size)], use_cache=True, update_past_key_values=True, block_size=block_size)
             logits, past_key_values = output.logits, output.past_key_values
@@ -46,6 +70,11 @@ class Fast_dLLM_QwenForCausalLM:
                     input_ids[predict_sample_idx, min_len] = next_token.squeeze(dim=-1)
         else:
             past_key_values = None
+
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        prefill_ms += (t1 - t0) * 1000.0
+        torch.cuda.nvtx.range_push("decode")
 
         seq_block_idx = seq_len // block_size
         finished_flag = torch.zeros((batch_size), device=self.device, dtype=torch.bool)
@@ -126,6 +155,8 @@ class Fast_dLLM_QwenForCausalLM:
                         finished_flag = finished_flag | finished_row_flags
 
                         step += 1
+                #(bsz, num_key_value_heads, seq_len, head_dim)
+                print(f"past_key_values size {past_key_values.key_cache[0].size()}")  
 
             if input_ids.shape[1] ==  x_t.shape[1]:
                 input_ids = x_t
@@ -156,7 +187,11 @@ class Fast_dLLM_QwenForCausalLM:
 
                 finished_flag = finished_flag[~finished_flag]
 
-
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        decode_ms += (t2 - t1) * 1000.0
+        torch.cuda.nvtx.range_pop()
+        print(f"[TIMER] prefill_ms={prefill_ms:.1f} | decode_ms={decode_ms:.1f}")
 
         # add not finished samples since max_new_tokens is reached
         if len(finished_samples) < batch_size:

@@ -63,6 +63,7 @@ from .configuration_llada import (
     ActivationCheckpointingStrategy,
 )
 
+from torch.profiler import profile, record_function
 if sys.version_info.minor > 8:
     from collections.abc import MutableMapping
 elif sys.version_info.minor == 8:
@@ -666,11 +667,15 @@ class LLaDABlock(nn.Module):
         attention mask if passed, and applying dropout if a probability greater than 0.0 is specified.
         """
         if self.flash_attn_func is not None and attn_mask is None:
+            # print(f"option1")  #this
+            print(f"q k v shape ,{q.transpose(1, 2).size()},{k.transpose(1, 2).size()},{v.transpose(1, 2).size()}，{q.transpose(1, 2).dtype}")
+            print(f"dropout_p ,{dropout_p}")
             r = self.flash_attn_func(
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), dropout_p=dropout_p, causal=False
             )
             return r.transpose(1, 2)
         else:
+            # print(f"option2")
             # torch's sdpa doesn't support GQA, so we're doing this
             assert k.size(1) == v.size(1)
             num_kv_heads = k.size(1)
@@ -745,6 +750,7 @@ class LLaDABlock(nn.Module):
         present = (k, v) if use_cache else None #present: None
         query_len, key_len = q.shape[-2], k.shape[-2]  # could be different if layer_past not None
 
+        torch.cuda.nvtx.range_push("rope_emb")
         if self.config.rope:
             # Apply rotary embeddings.
             if replace_position is None:
@@ -754,6 +760,7 @@ class LLaDABlock(nn.Module):
                 max_replace_pos = replace_position.nonzero(as_tuple=True)[1].max() + 1 if replace_position.any() else key_len
                 q, k = self.rotary_emb(q, k, max_replace_pos)
 
+        torch.cuda.nvtx.range_pop()
         if attention_bias is not None:
             # Resize and cast attention bias.
             # The current dtype of the attention bias might not match the dtype that the SDP attn function will
@@ -764,6 +771,7 @@ class LLaDABlock(nn.Module):
                 attention_bias[:, :, key_len - query_len : key_len, :key_len], dtype
             )
 
+        torch.cuda.nvtx.range_push("attention")
         # Get the attention scores.
         # shape: (B, nh, T, hs)
         att = self._scaled_dot_product_attention(
@@ -774,11 +782,16 @@ class LLaDABlock(nn.Module):
             dropout_p=0.0 if not self.training else self.config.attention_dropout,
             is_causal=False,
         )
+        torch.cuda.nvtx.range_pop()
+        
         # Re-assemble all head outputs side-by-side.
         att = att.transpose(1, 2).contiguous().view(B, T, C)
 
+        torch.cuda.nvtx.range_push("Wo_proj")
+        res = self.attn_out(att)
+        torch.cuda.nvtx.range_pop()
         # Apply output projection.
-        return self.attn_out(att), present
+        return res, present
 
 
     @abstractmethod
@@ -957,13 +970,18 @@ class LLaDALlamaBlock(LLaDABlock):
         #  - for group query attn q: (batch_size, seq_len, d_model)
         #                      k, v: (batch_size, seq_len, d_model // n_kv_heads)
         x_normed = self.attn_norm(x) #x:torch.Size([2, 168, 4096])
+        torch.cuda.nvtx.range_push("qkv_proj")
+        
         q = self.q_proj(x_normed) #q:torch.Size([2, 168, 4096])
         k = self.k_proj(x_normed) #k:torch.Size([2, 168, 4096])
         v = self.v_proj(x_normed) #v:torch.Size([2, 168, 4096])
+        print(f"q shape, {q.size()}")
+        torch.cuda.nvtx.range_pop()
         # attention_bias: None
         # layer_past: None
         # use_cache: False
         # Get attention scores.
+        
         if self._activation_checkpoint_fn is not None:
             att, cache = self._activation_checkpoint_fn(  # type: ignore
                 self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache,replace_position=replace_position
@@ -982,13 +1000,18 @@ class LLaDALlamaBlock(LLaDABlock):
             x = self._activation_checkpoint_fn(self.ff_norm, x)  # type: ignore
         else:
             x = self.ff_norm(x)
+        torch.cuda.nvtx.range_push("ff_proj")
         x, x_up = self.ff_proj(x), self.up_proj(x) # new add
+        torch.cuda.nvtx.range_pop()
         if self._activation_checkpoint_fn is not None:
             x = self._activation_checkpoint_fn(self.act, x)  # type: ignore
         else:
             x = self.act(x)
         x = x * x_up # new add
+        torch.cuda.nvtx.range_push("ff_out")
+        print(f"x shape, {x.size()}")
         x = self.ff_out(x)
+        torch.cuda.nvtx.range_pop()
         x = self.dropout(x)
         x = og_x + x
 

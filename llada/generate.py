@@ -21,6 +21,8 @@ import torch.nn.functional as F
 import os
 from transformers import AutoTokenizer, AutoModel
 from model.modeling_llada import LLaDAModelLM
+import time
+from torch.profiler import profile, ProfilerActivity, record_function
 
 def add_gumbel_noise(logits, temperature):
     '''
@@ -128,6 +130,26 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
     steps = steps // num_blocks
 
     nfe = 0
+            
+    prefill_flag = True
+    if prefill_flag:
+        prefix = x[:, :prompt.shape[1]] 
+        print("Prefill start")
+        torch.cuda.nvtx.range_push("Prefill")
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True, profile_memory=True, use_cuda=True) as prof:
+        output = model(prefix, use_cache=True)
+        timestamp = str(int(time.time() * 1000))
+        filename = f"trace_{timestamp}.json"
+        # prof.export_chrome_trace(filename)
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        print("Prefill end")
+        torch.cuda.nvtx.range_pop()
+        prefill_ms = (t1-t0) * 1000
+        print(f"[TIMER] prefill_ms={prefill_ms:.1f}")
+        return x, 1
             
     for num_block in range(num_blocks):
         current_block_start = prompt.shape[1] + num_block * block_length

@@ -15,6 +15,39 @@
 # SPDX-License-Identifier: Apache-2.0
 # Modified from LLaDA repos: https://github.com/ML-GSAI/LLaDA
 
+
+# ---- add begin: force GSM8K to load from local parquet when offline ----
+import os as _os
+import datasets as _hfds
+
+_ORIG_LOAD_DATASET = _hfds.load_dataset
+
+def _patched_load_dataset(path, name=None, *args, **kwargs):
+    """Intercept HF load_dataset for gsm8k and redirect to local parquet."""
+    # env: GSM8K_LOCAL_ROOT=/workspace/ydshi/dataset/gsm8k
+    local_root = "/workspace/ydshi/dataset/gsm8k"
+    want_local = bool(local_root) and path in ("openai/gsm8k", "gsm8k")
+
+    if want_local:
+        # split name: "main" 或 "socratic"；harness 默认用 "socratic"
+        split_name = name or "socratic"
+        data_files = {
+            "train": f"{local_root}/{split_name}/train-*.parquet",
+            "test":  f"{local_root}/{split_name}/test-*.parquet",
+        }
+        # 直接用 parquet builder，完全离线
+        return _ORIG_LOAD_DATASET("parquet", data_files=data_files)
+
+    # 其它数据集/路径按原逻辑
+    return _ORIG_LOAD_DATASET(path, name, *args, **kwargs)
+
+_hfds.load_dataset = _patched_load_dataset
+
+# 强烈建议：显式关闭联网，以免别的任务误连网
+_os.environ.setdefault("HF_HUB_OFFLINE", "1")
+_os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+# ---- add end ----
+
 '''
 This file is inspired by the code from https://github.com/ML-GSAI/SMDM
 '''
@@ -303,28 +336,44 @@ class LLaDAEvalHarness(LM):
             batched_requests.pop()
 
         start_time = time.time()
+        ban = set(self.tokenizer.all_special_ids + [self.mask_id])
+        allowed_ids = torch.tensor(
+            [i for i in range(self.tokenizer.vocab_size) if i not in ban],
+            device=self.device, dtype=torch.long
+        )
 
+    
         for batch in tqdm(batched_requests, desc="Generating..."):
             batched_input_ids = []
             max_len = 0
             pad_len = []
+            L = 2048
+            max_len = L
             for req in batch:
-                question = req.args[0]
-                if self.is_instruct:
-                    m = [{"role": "user", "content": question}]
-                    user_input = self.tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False)
-                    input_ids = self.tokenizer(user_input)['input_ids']
-                else:
-                    user_input = question
-                    input_ids = self.tokenizer(user_input)['input_ids']
-                batched_input_ids.append(input_ids)
-                max_len = max(max_len, len(input_ids))
-                pad_len.append(max_len - len(input_ids))
+
+                idx = torch.randint(0, allowed_ids.numel(), (1, L), device=self.device)
+                ids = allowed_ids[idx] 
+                batched_input_ids.append(ids)
+                pad_len.append(0)
+                # question = req.args[0]
+                # if self.is_instruct:
+                #     m = [{"role": "user", "content": question}]
+                #     user_input = self.tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False)
+                #     input_ids = self.tokenizer(user_input)['input_ids']
+                # else:
+                #     user_input = question
+                #     input_ids = self.tokenizer(user_input)['input_ids']
+                # batched_input_ids.append(input_ids)
+                # max_len = max(max_len, len(input_ids))
+                # pad_len.append(max_len - len(input_ids))
             
             # pad batched_input_ids to the same length
-            batched_input_ids = [torch.cat([torch.full((1, max_len - len(input_ids)), self.tokenizer.pad_token_id, dtype=torch.long, device=self.device), torch.tensor(input_ids, dtype=torch.long, device=self.device).unsqueeze(0)], dim=1) for input_ids in batched_input_ids]
-            batched_input_ids = torch.cat(batched_input_ids, dim=0)
-            batched_input_ids = batched_input_ids.to(self.device)
+            # batched_input_ids = [torch.cat([torch.full((1, max_len - len(input_ids)), self.tokenizer.pad_token_id, dtype=torch.long, device=self.device), torch.tensor(input_ids, dtype=torch.long, device=self.device).unsqueeze(0)], dim=1) for input_ids in batched_input_ids]
+            # batched_input_ids = torch.cat(batched_input_ids, dim=0)
+            # batched_input_ids = batched_input_ids.to(self.device)
+            batched_input_ids = torch.cat(batched_input_ids, dim=0).to(self.device) 
+            print(f"batched_input_ids size {batched_input_ids.size()}")
+            
             
             if self.batch_size == 1:
                 attention_mask = None
@@ -376,13 +425,13 @@ class LLaDAEvalHarness(LM):
                     for generated_answer in batched_generated_answer:
                         f.write(json.dumps(generated_answer, ensure_ascii=False) + '\n')
 
-            for i in range(len(batched_generated_answer)):
-                print('=' * 20)
-                # print('question: ', question)
-                print('answer: ', batched_generated_answer[i])
-                print('nfe: ', nfe)
-                print('avg nfe: ', num_nfe / len(output))
-                print('=' * 20, end='\n\n')
+            # for i in range(len(batched_generated_answer)):
+            #     print('=' * 20)
+            #     # print('question: ', question)
+            #     print('answer: ', batched_generated_answer[i])
+            #     print('nfe: ', nfe)
+            #     print('avg nfe: ', num_nfe / len(output))
+            #     print('=' * 20, end='\n\n')
             # self.accelerator.wait_for_everyone()
         end_time = time.time()
         if self.show_speed:
