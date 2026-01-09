@@ -21,6 +21,8 @@ import torch.nn.functional as F
 import os
 from transformers import AutoTokenizer, AutoModel
 from model.modeling_llada import LLaDAModelLM
+import time
+from torch.profiler import profile, ProfilerActivity, record_function
 
 def add_gumbel_noise(logits, temperature):
     '''
@@ -128,6 +130,7 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
     steps = steps // num_blocks
 
     nfe = 0
+    topk = 0
             
     for num_block in range(num_blocks):
         current_block_start = prompt.shape[1] + num_block * block_length
@@ -136,15 +139,24 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
         block_mask_index = (x[:, current_block_start:current_block_end] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
 
+        torch.cuda.nvtx.range_push("KVCache_Update")
         output = model(x, use_cache=True)
+        #应该是刷新KV cache，都没传入历史past_key_values,感觉推理的时候会占很多时间啊
         past_key_values = output.past_key_values
 
+        torch.cuda.nvtx.range_pop()
         mask_index = (x == mask_id)
         mask_index[:, current_block_end:] = 0
-        if factor is None:
-            x0, transfer_index = get_transfer_index(output.logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, 0] if threshold is None else None, threshold)
+
+        if topk != 0 :
+            x0, transfer_index = get_transfer_index_by_topk(output.logits, temperature, remasking, mask_index, 
+                                                    x, topk)
         else:
-            x0, transfer_index = get_transfer_index_dynamic(output.logits, temperature, remasking, mask_index, x, None, factor)
+            if factor is None:
+                x0, transfer_index = get_transfer_index(output.logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, 0] if threshold is None else None, threshold)
+            else:
+                x0, transfer_index = get_transfer_index_dynamic(output.logits, temperature, remasking, mask_index, x, None, factor)
+
         x[transfer_index] = x0[transfer_index]
 
         new_past_key_values = []
@@ -163,18 +175,26 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
             nfe += 1
             mask_index = (x[:, current_block_start:] == mask_id)
             mask_index[:, block_length:] = 0
-
+            # print(f"past_key_values size {past_key_values[0][0].size()}")  
             logits = model(x[:, current_block_start:], past_key_values=past_key_values, use_cache=True).logits
 
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
             x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
 
-            if factor is None:
-                x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index, 
-                                                x[:, current_block_start:], num_transfer_tokens[:, i] if threshold is None else None, threshold)
+            if topk != 0 :
+                x0, transfer_index = get_transfer_index_by_topk(logits, temperature, remasking, mask_index, 
+                                                        x[:, current_block_start:], topk)
             else:
-                x0, transfer_index = get_transfer_index_dynamic(logits, temperature, remasking, mask_index, 
-                                                x[:, current_block_start:], None, factor)
+                if factor is None:
+                    x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index, 
+                                                    x[:, current_block_start:], num_transfer_tokens[:, i] if threshold is None else None, threshold)
+                else:
+                    x0, transfer_index = get_transfer_index_dynamic(logits, temperature, remasking, mask_index, 
+                                                    x[:, current_block_start:], None, factor)
+                
+            # print(f"x:{x[:, current_block_start:][transfer_index]}  x0:{x0[transfer_index]}")
+            transfer_num = transfer_index.sum().item()  
+            print(f"transferred {transfer_num} tokens.")
             x[:, current_block_start:][transfer_index] = x0[transfer_index]
             
             i += 1
@@ -250,6 +270,58 @@ def generate_with_dual_cache(model, prompt, steps=128, gen_length=128, block_len
     return x, nfe
 
 
+
+def get_transfer_index_by_topk(logits, temperature, remasking, mask_index, x, topk):
+    """
+    保留 Gumbel noise 和 remasking 的原始逻辑，
+    但使用 'topk' 逻辑来决定每一步选择多少个 token。
+    
+    Args:
+        logits: 模型的原始输出 (b, l, vocab_size)
+        temperature: Gumbel noise 的温度
+        remasking: 'low_confidence' 或 'random'
+        mask_index:布尔掩码, 标记了哪些是 'mask' token (b, l)
+        x: 当前的 token 序列 (b, l)
+        topk: 每一步最多选择的 token 数量
+    """
+
+    logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+    x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
+
+    if remasking == 'low_confidence':
+        p = F.softmax(logits.to(torch.float64), dim=-1)
+        x0_p = torch.squeeze(
+            torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
+    else:
+        raise NotImplementedError(remasking)
+    
+    # x0 只在 mask_index 为 True 的地方保留预测值
+    x0 = torch.where(mask_index, x0, x)
+    # confidence 只在 mask_index 为 True 的地方保留置信度，其他地方设为 -inf
+    confidence = torch.where(mask_index, x0_p, -np.inf)
+
+    # --- 3. 【修改】按 topk 逻辑选择索引 ---
+    # 3.1. 计算每个 batch item 剩余多少 mask token
+    num_remaining_masks = mask_index.sum(dim=1) 
+    transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+    
+    # 3.2. 遍历 batch 中的每个样本
+    for j in range(confidence.shape[0]):
+        # 获取当前样本剩余的 mask 数量
+        num_masks_for_item = num_remaining_masks[j].item()
+        
+        # 选择 min(当前剩余的 mask 数量, topk)
+        k_to_select = min(num_masks_for_item, topk)
+        
+        if k_to_select > 0:
+            # 3.3. 选取置信度最高的 k_to_select 个 token
+            # 因为非 mask token 的置信度是 -inf，所以 topk 总是会从 mask token 中选取置信度最高的。
+            _, select_index = torch.topk(confidence[j], k=k_to_select)
+            # 3.4. 将这些选中的位置在 transfer_index 中设为 True
+            transfer_index[j, select_index] = True
+            
+    return x0, transfer_index
+
 def get_transfer_index(logits, temperature, remasking, mask_index, x, num_transfer_tokens, threshold=None):
     logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
     x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
@@ -265,7 +337,8 @@ def get_transfer_index(logits, temperature, remasking, mask_index, x, num_transf
     
     x0 = torch.where(mask_index, x0, x)
     confidence = torch.where(mask_index, x0_p, -np.inf)
-
+    print(f"mask_index:{mask_index.shape}")
+    print(f"confidence:{confidence.shape}")
     transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
     if threshold is not None:
         num_transfer_tokens = mask_index.sum(dim=1, keepdim=True)
@@ -276,6 +349,7 @@ def get_transfer_index(logits, temperature, remasking, mask_index, x, num_transf
             for k in range(1, num_transfer_tokens[j]):
                 if confidence[j, select_index[k]] < threshold:
                     transfer_index[j, select_index[k]] = False
+    print(f"transfer_index:{transfer_index.shape}")
     return x0, transfer_index
 
 def get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, num_transfer_tokens, factor=1):

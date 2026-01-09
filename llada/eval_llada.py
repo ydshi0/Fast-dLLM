@@ -15,6 +15,35 @@
 # SPDX-License-Identifier: Apache-2.0
 # Modified from LLaDA repos: https://github.com/ML-GSAI/LLaDA
 
+
+# ---- add begin: force GSM8K to load from local parquet when offline ----
+import os as _os
+import datasets as _hfds
+
+_ORIG_LOAD_DATASET = _hfds.load_dataset
+def _patched_load_dataset(path, name=None, *args, **kwargs):
+    """Intercept HF load_dataset for gsm8k and redirect to local parquet."""
+    # env: GSM8K_LOCAL_ROOT=/workspace/ydshi/dataset/gsm8k
+    local_root = "/workspace/ydshi/dataset/gsm8k"
+    want_local = bool(local_root) and path in ("openai/gsm8k", "gsm8k")
+
+    if want_local:
+        # split name: "main" 或 "socratic"；harness 默认用 "socratic"
+        split_name = name or "socratic"
+        data_files = {
+            "train": f"{local_root}/{split_name}/train-*.parquet",
+            "test":  f"{local_root}/{split_name}/test-*.parquet",
+        }
+        # 直接用 parquet builder，完全离线
+        return _ORIG_LOAD_DATASET("parquet", data_files=data_files)
+
+    # 其它数据集/路径按原逻辑
+    return _ORIG_LOAD_DATASET(path, name, *args, **kwargs)
+
+_hfds.load_dataset = _patched_load_dataset
+
+# ---- add end ----
+
 '''
 This file is inspired by the code from https://github.com/ML-GSAI/SMDM
 '''
@@ -325,6 +354,8 @@ class LLaDAEvalHarness(LM):
             batched_input_ids = [torch.cat([torch.full((1, max_len - len(input_ids)), self.tokenizer.pad_token_id, dtype=torch.long, device=self.device), torch.tensor(input_ids, dtype=torch.long, device=self.device).unsqueeze(0)], dim=1) for input_ids in batched_input_ids]
             batched_input_ids = torch.cat(batched_input_ids, dim=0)
             batched_input_ids = batched_input_ids.to(self.device)
+            # batched_input_ids = torch.cat(batched_input_ids, dim=0).to(self.device) 
+            print(f"batched_input_ids size {batched_input_ids.size()}")         
             
             if self.batch_size == 1:
                 attention_mask = None

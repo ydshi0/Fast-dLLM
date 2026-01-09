@@ -1,0 +1,74 @@
+The following values were not passed to `accelerate launch` and had defaults used instead:
+	`--num_processes` was set to a value of `1`
+	`--num_machines` was set to a value of `1`
+	`--mixed_precision` was set to a value of `'no'`
+	`--dynamo_backend` was set to a value of `'no'`
+To avoid this warning pass in values for each of the problematic parameters or run `accelerate config`.
+Traceback (most recent call last):
+  File "/workspace/Fast-dLLM/llada/eval_llada.py", line 429, in <module>
+    cli_evaluate()
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/lm_eval/__main__.py", line 308, in cli_evaluate
+    task_manager = TaskManager(include_path=args.include_path)
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/lm_eval/tasks/__init__.py", line 35, in __init__
+    self._task_index = self.initialize_tasks(
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/lm_eval/tasks/__init__.py", line 82, in initialize_tasks
+    tasks = self._get_task_and_group(task_dir)
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/lm_eval/tasks/__init__.py", line 480, in _get_task_and_group
+    config = utils.load_yaml_config(yaml_path, mode="simple")
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/lm_eval/utils.py", line 458, in load_yaml_config
+    yaml_config = yaml.full_load(file)
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/yaml/__init__.py", line 105, in full_load
+    return load(stream, FullLoader)
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/yaml/__init__.py", line 81, in load
+    return loader.get_single_data()
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/yaml/constructor.py", line 49, in get_single_data
+    node = self.get_single_node()
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/yaml/composer.py", line 36, in get_single_node
+    document = self.compose_document()
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/yaml/composer.py", line 55, in compose_document
+    node = self.compose_node(None, None)
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/yaml/composer.py", line 84, in compose_node
+    node = self.compose_mapping_node(anchor)
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/yaml/composer.py", line 133, in compose_mapping_node
+    item_value = self.compose_node(node, item_key)
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/yaml/composer.py", line 82, in compose_node
+    node = self.compose_sequence_node(anchor)
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/yaml/composer.py", line 111, in compose_sequence_node
+    node.value.append(self.compose_node(node, index))
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/yaml/composer.py", line 84, in compose_node
+    node = self.compose_mapping_node(anchor)
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/yaml/composer.py", line 133, in compose_mapping_node
+    item_value = self.compose_node(node, item_key)
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/yaml/composer.py", line 64, in compose_node
+    if self.check_event(AliasEvent):
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/yaml/parser.py", line 98, in check_event
+    self.current_event = self.state()
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/yaml/parser.py", line 449, in parse_block_mapping_value
+    if not self.check_token(KeyToken, ValueToken, BlockEndToken):
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/yaml/scanner.py", line 116, in check_token
+    self.fetch_more_tokens()
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/yaml/scanner.py", line 255, in fetch_more_tokens
+    return self.fetch_plain()
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/yaml/scanner.py", line 679, in fetch_plain
+    self.tokens.append(self.scan_plain())
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/yaml/scanner.py", line 1305, in scan_plain
+    spaces = self.scan_plain_spaces(indent, start_mark)
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/yaml/scanner.py", line 1332, in scan_plain_spaces
+    self.forward()
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/root/miniconda3/envs/fast-dllm/bin/accelerate", line 7, in <module>
+    sys.exit(main())
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/accelerate/commands/accelerate_cli.py", line 50, in main
+    args.func(args)
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/accelerate/commands/launch.py", line 1235, in launch_command
+    simple_launcher(args)
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/site-packages/accelerate/commands/launch.py", line 820, in simple_launcher
+    process.wait()
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/subprocess.py", line 1209, in wait
+    return self._wait(timeout=timeout)
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/subprocess.py", line 1959, in _wait
+    (pid, sts) = self._try_wait(0)
+  File "/root/miniconda3/envs/fast-dllm/lib/python3.10/subprocess.py", line 1917, in _try_wait
+    (pid, sts) = os.waitpid(self.pid, wait_flags)
+KeyboardInterrupt

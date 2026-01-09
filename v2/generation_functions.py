@@ -2,6 +2,7 @@ from typing import Callable, Optional, Union
 import torch
 import types
 from transformers.utils import auto_docstring, logging
+import time
 
 # Constants for Fast_dLLM model
 FAST_DLLM_MASK_ID = 151665
@@ -33,6 +34,11 @@ class Fast_dLLM_QwenForCausalLM:
         num_blocks = max_new_tokens // block_size + seq_len.max().item() // block_size
         batch_size = input_ids.shape[0]
 
+        prefill_ms = 0
+        decode_ms = 0
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        torch.cuda.nvtx.range_push("prefill")
         if min_len > block_size:
             output = self.forward(input_ids=input_ids[:, :(min_len // block_size * block_size)], use_cache=True, update_past_key_values=True, block_size=block_size)
             logits, past_key_values = output.logits, output.past_key_values
@@ -46,6 +52,12 @@ class Fast_dLLM_QwenForCausalLM:
                     input_ids[predict_sample_idx, min_len] = next_token.squeeze(dim=-1)
         else:
             past_key_values = None
+
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        torch.cuda.nvtx.range_pop()
+        prefill_ms += (t1 - t0) * 1000.0
+        torch.cuda.nvtx.range_push("decode")
 
         seq_block_idx = seq_len // block_size
         finished_flag = torch.zeros((batch_size), device=self.device, dtype=torch.bool)
@@ -71,6 +83,8 @@ class Fast_dLLM_QwenForCausalLM:
             block_past_key_values = None
             while True:
                 mask_idx = (x_t[:, -block_size:] == mask_id)
+                # print(f"option1 {mask_idx.sum() == 0}")
+                # 这个每轮打印2次
                 if mask_idx.sum() == 0:
                     for sample_idx in range(x_t.shape[0]):
                         if finished_flag[sample_idx] and seq_len[sample_idx] < (block_idx + 1) * block_size:
@@ -78,7 +92,9 @@ class Fast_dLLM_QwenForCausalLM:
                             x_t[sample_idx, seq_len[sample_idx]+stop_token_idx+1:] = tokenizer.pad_token_id
                     if finished_flag.all():
                         break
+                    torch.cuda.nvtx.range_push("KV cache update")
                     output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=True, block_size=block_size)
+                    torch.cuda.nvtx.range_pop()
                     logits, past_key_values = output.logits, output.past_key_values
                     next_token = logits[:, -1:, :].argmax(dim=-1)
                     next_token[finished_flag] = tokenizer.pad_token_id
@@ -98,7 +114,11 @@ class Fast_dLLM_QwenForCausalLM:
                         if mask_idx[:, start:end].sum() == 0:
                             break
                         
+                        # print(f"start {start} end {end}")
+                        # print(f"xt {x_t[:, start]} ")
                         if use_block_cache:
+                            
+                            # print(f"option2 {(x_t[:, -block_size+small_block_start_idx] == mask_id).any()}")
                             if block_past_key_values is None or (x_t[:, -block_size+small_block_start_idx] == mask_id).any():
                                 output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True)
                                 logits, block_past_key_values = output.logits, output.block_past_key_values
@@ -115,17 +135,21 @@ class Fast_dLLM_QwenForCausalLM:
                         x1_p = torch.squeeze(torch.gather(p_1t, dim=-1, index=torch.unsqueeze(x_1, -1)), -1)
                         x1_p = torch.where(mask_idx[:, start:end], x1_p, -torch.inf)
 
-                        unmask_idx = (x1_p > threshold)
+                        # unmask_idx = (x1_p > threshold)
+                        unmask_idx = torch.zeros_like(x1_p, dtype=torch.bool)
+                        # print(f"unmask_idx {unmask_idx}")
                         max_prob_idx = x1_p.argmax(dim=-1)
                         unmask_idx[torch.arange(x_1.shape[0]), max_prob_idx] = True
                         unmask_idx = unmask_idx & mask_idx[:, start:end]
-
+                        print(f"unmask_idx {unmask_idx}")
                         x_t[:, start:end][unmask_idx] = x_1[unmask_idx]
 
                         finished_row_flags = ((x_1 == stop_token) & unmask_idx).any(dim=1) # shape: [B]
                         finished_flag = finished_flag | finished_row_flags
 
                         step += 1
+                #(bsz, num_key_value_heads, seq_len, head_dim)
+                print(f"past_key_values size {past_key_values.key_cache[0].size()}")  
 
             if input_ids.shape[1] ==  x_t.shape[1]:
                 input_ids = x_t
@@ -156,7 +180,11 @@ class Fast_dLLM_QwenForCausalLM:
 
                 finished_flag = finished_flag[~finished_flag]
 
-
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        decode_ms += (t2 - t1) * 1000.0
+        torch.cuda.nvtx.range_pop()
+        print(f"[TIMER] prefill_ms={prefill_ms:.1f} | decode_ms={decode_ms:.1f}")
 
         # add not finished samples since max_new_tokens is reached
         if len(finished_samples) < batch_size:
